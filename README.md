@@ -30,7 +30,7 @@ The `.env` file in the plugin directory is read by default.
 Default：
 
 ```text
-http://127.0.0.1:8080/v1/actions/dispatch
+POST http://127.0.0.1:8080/v1/dispatch
 ```
 
 ## Backend Response 

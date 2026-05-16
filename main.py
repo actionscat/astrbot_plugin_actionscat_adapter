@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, AsyncGenerator
 
 import httpx
+from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 
@@ -40,14 +41,22 @@ def load_dotenv(path: Path) -> None:
         os.environ.setdefault(key, value)
 
 
-def load_settings() -> Settings:
+def load_settings(config: dict = None) -> Settings:
+    config = config or {}
     load_dotenv(PLUGIN_DIR / ".env")
+    
+    scheme = config.get("scheme")
+    host = config.get("host")
+    port = config.get("port")
+    path = config.get("path")
+    timeout = config.get("timeout_seconds")
+    
     return Settings(
-        scheme=os.getenv("ACTIONSCAT_BACKEND_SCHEME", "http"),
-        host=os.getenv("ACTIONSCAT_BACKEND_HOST", "127.0.0.1"),
-        port=int(os.getenv("ACTIONSCAT_BACKEND_PORT", "8080")),
-        path=os.getenv("ACTIONSCAT_DISPATCH_PATH", "/v1/actions/dispatch"),
-        timeout_seconds=float(os.getenv("ACTIONSCAT_TIMEOUT_SECONDS", "10")),
+        scheme=scheme if scheme else os.getenv("ACTIONSCAT_BACKEND_SCHEME", "http"),
+        host=host if host else os.getenv("ACTIONSCAT_BACKEND_HOST", "127.0.0.1"),
+        port=int(port) if port is not None else int(os.getenv("ACTIONSCAT_BACKEND_PORT", "8080")),
+        path=path if path else os.getenv("ACTIONSCAT_DISPATCH_PATH", "/v1/dispatch"),
+        timeout_seconds=float(timeout) if timeout is not None else float(os.getenv("ACTIONSCAT_TIMEOUT_SECONDS", "10")),
     )
 
 
@@ -79,9 +88,9 @@ class ActionsCatClient:
     "0.1.1",
 )
 class ActionsCatAdapter(Star):
-    def __init__(self, context: Context):
+    def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
-        self.settings = load_settings()
+        self.settings = load_settings(config)
         self.client = ActionsCatClient(self.settings)
 
     @filter.event_message_type(filter.EventMessageType.ALL)
@@ -90,9 +99,11 @@ class ActionsCatAdapter(Star):
 
         try:
             result = await self.client.dispatch(payload)
+            logger.info(f"[actionscat-adapter] Dispatched payload to {self.client.settings.dispatch_url} : {payload}")
+            logger.info(f"[actionscat-adapter] Received raw result from backend: {result} (type: {type(result)})")
         except Exception as exc:
             # Keep chat quiet when backend is unavailable.
-            print(f"[actionscat-adapter] dispatch failed: {exc}")
+            logger.exception(f"[actionscat-adapter] dispatch failed: {exc}")
             return
 
         async for response in build_astrbot_response(event, result):
@@ -169,14 +180,17 @@ async def build_astrbot_response(
     if result is None:
         return
 
-    if isinstance(result, str):
-        if result:
-            yield event.plain_result(result)
-        return
+    # 如果后端返回的不是标准 JSON dict，则静默
+    #if not isinstance(result, dict):
+    #    return
 
-    if not isinstance(result, dict):
-        yield event.plain_result(str(result))
-        return
+    # 如果后端返回了业务级别的错误信息（如 detail、error、traceback），拒绝下发到群聊中
+    # if "detail" in result or "error" in result or "traceback" in result:
+    #    return
+        
+    # 如果后端返回的是它内部用来测试的 debug_echo，我们也可以在这里直接屏蔽它
+    # if result.get("action") == "debug_echo":
+    #     return
 
     if is_no_match(result):
         return
@@ -187,11 +201,9 @@ async def build_astrbot_response(
             response = message_to_result(event, item)
             if response is not None:
                 yield response
-        return
-
-    response = message_to_result(event, result)
-    if response is not None:
-        yield response
+    
+    # 严格按照契约：要求后端必须返回 {"messages": [...]} 才执行发送。
+    # 丢弃了此前的“将整个 result 字典作为单个消息体解析”的保底逻辑，避免误发调试 JSON。
 
 
 def is_no_match(result: dict[str, Any]) -> bool:
