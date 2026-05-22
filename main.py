@@ -10,6 +10,8 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 
+__all__ = ["ActionsCatAdapter"]
+
 PLUGIN_DIR = Path(__file__).resolve().parent
 
 
@@ -68,17 +70,40 @@ class ActionsCatClient:
     async def close(self) -> None:
         await self._client.aclose()
 
-    async def dispatch(self, payload: dict[str, str]) -> Any:
-        response = await self._client.post(self.settings.dispatch_url, json=payload)
-        response.raise_for_status()
+    async def dispatch(self, payload: dict[str, str]) -> tuple[Any, str | None]:
+        """Dispatch payload to ActionsCat backend.
+        
+        Returns:
+            tuple: (result, error_message)
+                - result: Response data if successful, None otherwise
+                - error_message: None if successful, error description if failed
+        """
+        try:
+            response = await self._client.post(self.settings.dispatch_url, json=payload)
+            response.raise_for_status()
 
-        if response.status_code == 204 or not response.content:
-            return None
+            if response.status_code == 204 or not response.content:
+                return None, None
 
-        content_type = response.headers.get("content-type", "")
-        if "application/json" in content_type:
-            return response.json()
-        return response.text
+            content_type = response.headers.get("content-type", "")
+            if "application/json" in content_type:
+                return response.json(), None
+            return response.text, None
+        except httpx.TimeoutException:
+            error_msg = f"Backend timeout ({self.settings.timeout_seconds}s) at {self.settings.dispatch_url}"
+            return None, error_msg
+        except httpx.ConnectError:
+            error_msg = f"Cannot connect to backend at {self.settings.dispatch_url}"
+            return None, error_msg
+        except httpx.HTTPStatusError as e:
+            error_msg = f"Backend returned HTTP {e.response.status_code} at {self.settings.dispatch_url}"
+            return None, error_msg
+        except httpx.RequestError as e:
+            error_msg = f"Request failed: {e}"
+            return None, error_msg
+        except Exception as e:
+            error_msg = f"Unexpected error: {type(e).__name__}: {e}"
+            return None, error_msg
 
 
 @register(
@@ -97,14 +122,15 @@ class ActionsCatAdapter(Star):
     async def forward_to_actionscat(self, event: AstrMessageEvent):
         payload = build_actionscat_payload(event)
 
-        try:
-            result = await self.client.dispatch(payload)
-            logger.info(f"[actionscat-adapter] Dispatched payload to {self.client.settings.dispatch_url} : {payload}")
-            logger.info(f"[actionscat-adapter] Received raw result from backend: {result} (type: {type(result)})")
-        except Exception as exc:
+        result, error = await self.client.dispatch(payload)
+        
+        if error:
+            logger.error(f"[actionscat-adapter] {error}")
             # Keep chat quiet when backend is unavailable.
-            logger.exception(f"[actionscat-adapter] dispatch failed: {exc}")
             return
+
+        logger.info(f"[actionscat-adapter] Dispatched payload to {self.client.settings.dispatch_url} : {payload}")
+        logger.info(f"[actionscat-adapter] Received raw result from backend: {result} (type: {type(result)})")
 
         async for response in build_astrbot_response(event, result):
             yield response
